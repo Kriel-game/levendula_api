@@ -27,5 +27,6 @@ jobs:
     - name: Pytest futtatása
       env:
         PYTHONPATH: .
+        DATABASE_URL: "sqlite:///./test.db"
       run: |
         python -m pytest
