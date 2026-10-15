@@ -3,12 +3,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
 
-# Importáljuk a korábban megírt moduljainkat
-from database import SessionLocal, engine
-import models
-import schemas
-from parse_log_line import parse_log_line
-from security_engine import SecurityRuleEngine
+# Importáljuk a modulokat a Render számára is érthető útvonalon
+from Backend.database import SessionLocal, engine
+from Backend import models
+from Backend import schemas
+from Backend.parse_log_line import parse_log_line
+from Backend.security_engine import SecurityRuleEngine
 
 # Adatbázis táblák létrehozása induláskor
 models.Base.metadata.create_all(bind=engine)
