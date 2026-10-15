@@ -117,6 +117,85 @@ def restore_backup(backup_path, new_db_url):
         if 'db' in locals():
             db.close()
 
+
+WEB_SERVICE_ID = "srv-db8hc7nf3r2c73fcip30"
+
+
+async def perform_database_rotation():
+    """
+    6.3. Automatizált csere végrehajtása
+    """
+    print("\n[Karbantartó] *** AUTOMATIKUS ADATBÁZIS CSERE INDUL ***")
+
+    # 1. Kimentjük a meglévő adatokat a biztonságos JSON fájlunkba
+    backup_path = create_backup()
+    if not backup_path:
+        print("[Karbantartó] Mentés sikertelen, megszakítás!")
+        return
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        # 2. Megkeressük a jelenlegi adatbázist
+        db_resp = await client.get(f"{RENDER_API_URL}/postgres", headers=HEADERS)
+        if db_resp.status_code == 200 and len(db_resp.json()) > 0:
+            old_db_id = db_resp.json()[0]['postgres']['id']
+            print(f"[Karbantartó] Régi adatbázis törlése ({old_db_id}) a limit miatt...")
+            # Töröljük a régit, hogy helyet csináljunk az újnak
+            await client.delete(f"{RENDER_API_URL}/postgres/{old_db_id}", headers=HEADERS)
+            await asyncio.sleep(15)  # Várunk kicsit, hogy a Render felszabadítsa a szervert
+
+        # 3. Vadonatúj adatbázis létrehozása (Frankfurt régióban)
+        new_name = f"levendula-db-{datetime.now().strftime('%H%M%S')}"
+        print(f"[Karbantartó] Új PostgreSQL adatbázis létrehozása ({new_name})...")
+
+        payload = {
+            "name": new_name,
+            "plan": "free",
+            "postgresVersion": "15",
+            "region": "fra"
+        }
+        create_resp = await client.post(f"{RENDER_API_URL}/postgres", headers=HEADERS, json=payload)
+
+        if create_resp.status_code != 201:
+            print(f"[Karbantartó] Hiba a létrehozásnál: {create_resp.text}")
+            return
+
+        new_db = create_resp.json()
+        new_db_id = new_db['id']
+
+        # Kapcsolati linkek kinyerése
+        ext_url = new_db['connectionInfo']['externalConnectionString'].replace("postgres://", "postgresql://", 1)
+        int_url = new_db['connectionInfo']['internalConnectionString'].replace("postgres://", "postgresql://", 1)
+
+        print("[Karbantartó] Várakozás az új adatbázis felállására (ez kb. 1-2 perc)...")
+        for _ in range(30):
+            status_resp = await client.get(f"{RENDER_API_URL}/postgres/{new_db_id}", headers=HEADERS)
+            if status_resp.json().get("status") == "available":
+                break
+            await asyncio.sleep(10)
+
+        # 4. Adatok visszaállítása a mentésből
+        success = restore_backup(backup_path, ext_url)
+        if not success:
+            print("[Karbantartó] A visszaállítás sikertelen volt.")
+            return
+
+        # 5. A FastAPI webszerver átállítása az új adatbázisra (A NAGY TRÜKK!)
+        print(f"[Karbantartó] A webszerver (API) összekötése az új adatbázissal...")
+        env_payload = [
+            {"key": "DATABASE_URL", "value": int_url}  # A belső (internal) link sokkal gyorsabb a felhőn belül
+        ]
+        env_resp = await client.put(
+            f"{RENDER_API_URL}/services/{WEB_SERVICE_ID}/env-vars",
+            headers=HEADERS,
+            json=env_payload
+        )
+
+        if env_resp.status_code == 200:
+            print("[Karbantartó] *** SIKERES CSERE! ***")
+            print("A régi adatbázist megsemmisítettük. A rendszer egy vadonatúj adatbázison fut megszakítás nélkül!")
+        else:
+            print(f"[Karbantartó] Hiba az átállításnál: {env_resp.text}")
+
 async def check_database_status():
     """
     6.1. Időzített, aszinkron állapotellenőrzés
@@ -152,7 +231,8 @@ async def main():
 
     # Beállítjuk, hogy a check_database_status függvény 1 percenként lefusson
     scheduler.add_job(check_database_status, 'interval', minutes=1)
-
+    # Beállítjuk, hogy a perform_database_rotation (A csere) fusson le tesztként, mondjuk 1 perc múlva
+    scheduler.add_job(perform_database_rotation, 'interval', minutes=2)
     scheduler.start()
     print("Időzítő elindítva. Első ellenőrzés 1 perc múlva... Leállítás: Ctrl+C")
 
