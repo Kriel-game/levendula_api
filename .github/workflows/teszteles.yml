@@ -25,5 +25,7 @@ jobs:
         pip install -r requirements.txt
 
     - name: Pytest futtatása
+      env:
+        PYTHONPATH: .
       run: |
         python -m pytest
