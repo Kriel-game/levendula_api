@@ -232,7 +232,7 @@ async def main():
     # Beállítjuk, hogy a check_database_status függvény 1 percenként lefusson
     scheduler.add_job(check_database_status, 'interval', minutes=1)
     # Beállítjuk, hogy a perform_database_rotation (A csere) fusson le tesztként, mondjuk 1 perc múlva
-    scheduler.add_job(perform_database_rotation, 'interval', minutes=2)
+    # scheduler.add_job(perform_database_rotation, 'interval', minutes=2)
     scheduler.start()
     print("Időzítő elindítva. Első ellenőrzés 1 perc múlva... Leállítás: Ctrl+C")
 
