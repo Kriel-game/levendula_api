@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
-
+from Backend import models
+from Backend.database import engine
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
@@ -88,7 +89,7 @@ def test_api_import_and_retrieve_integration():
     API kérés (POST) -> Tesztadatbázis írás -> API válasz (GET) -> Ellenőrzés.
     """
     # 1. Előkészítés: Létrehozzuk a táblákat az üres tesztadatbázisban
-    Base.metadata.create_all(bind=test_engine)
+    models.Base.metadata.create_all(bind=engine)
 
     # 2. Végrehajtás (Adatfelvitel)
     raw_log = '192.168.1.1 - - [10/Sep/2026:16:05:12 +0200] "GET /admin.php?user=1=1 HTTP/1.1" 200 1024 "-" "-"'
