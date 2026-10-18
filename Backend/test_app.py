@@ -8,8 +8,6 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
 # Importáljuk az alkalmazásunk moduljait (a fájlnevek a te projektedhez igazítandók)
-from main import app, get_db
-from database import Base
 from security_engine import SecurityRuleEngine
 
 # =====================================================================
