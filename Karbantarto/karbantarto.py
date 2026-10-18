@@ -1,29 +1,42 @@
 import asyncio
 import os
-import httpx
-from pathlib import Path
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
 import json
 import sys
+from pathlib import Path
 from datetime import datetime
+import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# A Backend mappa hozzáadása a rendszer útvonalaihoz, hogy lássuk a modelleket
+# =====================================================================
+# AUTOMATIZÁLT FELHŐS ADATBÁZIS-KARBANTARTÓ ÉS MENTŐ RENDSZER
+# Szerepe: A 6. fejezet követelményeit megvalósító önálló háttérszolgáltatás.
+# Három fő feladatot lát el:
+# 1. Időzített, aszinkron állapotellenőrzés a Render REST API-n keresztül (6.1).
+# 2. Tiszta Python alapú adatbázis-mentés (JSON export) és séma/adat visszaállítás (6.2).
+# 3. Automatizált adatbázis-rotáció (törlés, új példány igénylése, migráció és
+#    a FastAPI webszerver környezeti változójának dinamikus átkötése) (6.3).
+# =====================================================================
+
+# Hozzáadjuk a projekt gyökérmappáját a Python keresési útvonalához (sys.path),
+# hogy a Karbantarto mappából futtatva is elérjük a 'Backend' csomag modelljeit.
 project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 from Backend.database import SessionLocal
 from Backend.models import SecurityEvent, Base
-# Pontosan megmutatjuk neki, hol van a Backend mappában lévő .env fájl
-env_path = Path(__file__).parent.parent / "Backend" / ".env"
+
+# Betöltjük a Backend mappában található .env fájlt (benne a DATABASE_URL és RENDER_API_KEY)
+env_path = project_root / "Backend" / ".env"
 load_dotenv(dotenv_path=env_path)
 
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 RENDER_API_URL = "https://api.render.com/v1"
+WEB_SERVICE_ID = "srv-db8hc7nf3r2c73fcip30"
 
-# A Render API által elvárt fejlécek (hitelesítés)
+# Hitelesítési fejléc (Bearer Token) a Render REST API hívásokhoz
 HEADERS = {
     "Authorization": f"Bearer {RENDER_API_KEY}",
     "Accept": "application/json"
@@ -32,7 +45,9 @@ HEADERS = {
 
 def create_backup():
     """
-    Kiolvassa az aktuális adatbázis összes rekordját, és kimenti egy tartós JSON fájlba.
+    6.2. Biztonsági mentés (Export):
+    Kiolvassa az aktuális adatbázis összes 'SecurityEvent' rekordját SQLAlchemy-vel,
+    és elmenti őket egy időbélyeggel ellátott, hordozható JSON fájlba.
     """
     print("\n[Mentés] Adatok kiolvasása a jelenlegi adatbázisból...")
     db = SessionLocal()
@@ -52,11 +67,9 @@ def create_backup():
                 "reason": event.reason
             })
 
-        # Időbélyeggel ellátott fájlnév (pl. mentes_20261015_183000.json)
         backup_filename = f"mentes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         backup_path = Path(__file__).parent / backup_filename
 
-        # Fájlba írás UTF-8 kódolással
         with open(backup_path, "w", encoding="utf-8") as f:
             json.dump(backup_data, f, ensure_ascii=False, indent=4)
 
@@ -72,30 +85,30 @@ def create_backup():
 
 def restore_backup(backup_path, new_db_url):
     """
-    Újraépíti az adatbázis sémát egy üres példányban, majd betölti a JSON mentést.
+    6.2. Adatvisszaállítás (Import és Sémaépítés):
+    Kapcsolódik az újonnan létrehozott üres adatbázishoz, felépíti a táblaszerkezetet
+    (Base.metadata.create_all), majd visszatölti a JSON mentésben lévő rekordokat.
     """
-    # Biztonsági okokból a jelszót levágjuk a kiírásnál (a @ jel utáni részt mutatjuk)
     safe_url = new_db_url.split('@')[-1] if '@' in new_db_url else new_db_url
     print(f"\n[Visszaállítás] Adatok betöltése az új példányba ({safe_url})...")
 
-    # Új kapcsolat kiépítése a FRISS adatbázishoz
     new_engine = create_engine(new_db_url)
     NewSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=new_engine)
 
     try:
-        # 1. Létrehozzuk az üres táblákat (séma helyreállítása)
+        # 1. Táblák (séma) létrehozása az új adatbázisban
         Base.metadata.create_all(bind=new_engine)
 
-        # 2. JSON beolvasása
+        # 2. Mentett adatok beolvasása a JSON fájlból
         with open(backup_path, "r", encoding="utf-8") as f:
             backup_data = json.load(f)
 
         db = NewSessionLocal()
 
-        # 3. Adatok feltöltése
+        # 3. Rekordok beszúrása az eredeti azonosítók (ID) megtartásával
         for item in backup_data:
             event = SecurityEvent(
-                id=item["id"],  # Megtartjuk az eredeti ID-ket a kapcsolatok miatt
+                id=item["id"],
                 ip_address=item["ip_address"],
                 timestamp=item["timestamp"],
                 http_method=item["http_method"],
@@ -118,32 +131,30 @@ def restore_backup(backup_path, new_db_url):
             db.close()
 
 
-WEB_SERVICE_ID = "srv-db8hc7nf3r2c73fcip30"
-
-
 async def perform_database_rotation():
     """
-    6.3. Automatizált csere végrehajtása
+    6.3. Automatizált adatbázis-csere (Rotáció):
+    Végrehajtja a teljes migrációs ciklust: mentés -> régi törlése -> új létrehozása ->
+    adatok visszatöltése -> a FastAPI webszerver DATABASE_URL változójának frissítése.
     """
     print("\n[Karbantartó] *** AUTOMATIKUS ADATBÁZIS CSERE INDUL ***")
 
-    # 1. Kimentjük a meglévő adatokat a biztonságos JSON fájlunkba
+    # 1. Biztonsági mentés készítése; ha sikertelen, nem nyúlunk az éles adatbázishoz!
     backup_path = create_backup()
     if not backup_path:
-        print("[Karbantartó] Mentés sikertelen, megszakítás!")
+        print("[Karbantartó] Mentés sikertelen, a csere biztonsági okokból megszakítva!")
         return
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        # 2. Megkeressük a jelenlegi adatbázist
+        # 2. Jelenlegi adatbázis lekérdezése és törlése
         db_resp = await client.get(f"{RENDER_API_URL}/postgres", headers=HEADERS)
         if db_resp.status_code == 200 and len(db_resp.json()) > 0:
             old_db_id = db_resp.json()[0]['postgres']['id']
-            print(f"[Karbantartó] Régi adatbázis törlése ({old_db_id}) a limit miatt...")
-            # Töröljük a régit, hogy helyet csináljunk az újnak
+            print(f"[Karbantartó] Régi adatbázis törlése ({old_db_id})...")
             await client.delete(f"{RENDER_API_URL}/postgres/{old_db_id}", headers=HEADERS)
-            await asyncio.sleep(15)  # Várunk kicsit, hogy a Render felszabadítsa a szervert
+            await asyncio.sleep(15)
 
-        # 3. Vadonatúj adatbázis létrehozása (Frankfurt régióban)
+        # 3. Új PostgreSQL példány igénylése a Render API-tól
         new_name = f"levendula-db-{datetime.now().strftime('%H%M%S')}"
         print(f"[Karbantartó] Új PostgreSQL adatbázis létrehozása ({new_name})...")
 
@@ -156,33 +167,33 @@ async def perform_database_rotation():
         create_resp = await client.post(f"{RENDER_API_URL}/postgres", headers=HEADERS, json=payload)
 
         if create_resp.status_code != 201:
-            print(f"[Karbantartó] Hiba a létrehozásnál: {create_resp.text}")
+            print(f"[Karbantartó] Hiba a létrehozásnál (Render kvóta / cooldown): {create_resp.text}")
             return
 
         new_db = create_resp.json()
         new_db_id = new_db['id']
 
-        # Kapcsolati linkek kinyerése
         ext_url = new_db['connectionInfo']['externalConnectionString'].replace("postgres://", "postgresql://", 1)
         int_url = new_db['connectionInfo']['internalConnectionString'].replace("postgres://", "postgresql://", 1)
 
-        print("[Karbantartó] Várakozás az új adatbázis felállására (ez kb. 1-2 perc)...")
+        # Várakozás (polling), amíg az új adatbázis eléri az 'available' állapotot
+        print("[Karbantartó] Várakozás az új adatbázis felállására...")
         for _ in range(30):
             status_resp = await client.get(f"{RENDER_API_URL}/postgres/{new_db_id}", headers=HEADERS)
             if status_resp.json().get("status") == "available":
                 break
             await asyncio.sleep(10)
 
-        # 4. Adatok visszaállítása a mentésből
+        # 4. Mentett adatok visszatöltése az új adatbázisba a külső (External) linken keresztül
         success = restore_backup(backup_path, ext_url)
         if not success:
             print("[Karbantartó] A visszaállítás sikertelen volt.")
             return
 
-        # 5. A FastAPI webszerver átállítása az új adatbázisra (A NAGY TRÜKK!)
-        print(f"[Karbantartó] A webszerver (API) összekötése az új adatbázissal...")
+        # 5. A FastAPI webszerver környezeti változójának (DATABASE_URL) frissítése a belső (Internal) linkre
+        print("[Karbantartó] A webszerver (API) összekötése az új adatbázissal...")
         env_payload = [
-            {"key": "DATABASE_URL", "value": int_url}  # A belső (internal) link sokkal gyorsabb a felhőn belül
+            {"key": "DATABASE_URL", "value": int_url}
         ]
         env_resp = await client.put(
             f"{RENDER_API_URL}/services/{WEB_SERVICE_ID}/env-vars",
@@ -192,27 +203,26 @@ async def perform_database_rotation():
 
         if env_resp.status_code == 200:
             print("[Karbantartó] *** SIKERES CSERE! ***")
-            print("A régi adatbázist megsemmisítettük. A rendszer egy vadonatúj adatbázison fut megszakítás nélkül!")
         else:
             print(f"[Karbantartó] Hiba az átállításnál: {env_resp.text}")
 
+
 async def check_database_status():
     """
-    6.1. Időzített, aszinkron állapotellenőrzés
-    Lekérdezi a Renderen lévő PostgreSQL adatbázisok állapotát.
+    6.1. Időzített, aszinkron állapotellenőrzés:
+    Nem-blokkoló (async/await) HTTP kéréssel lekérdezi a Render API-tól
+    az adatbázisok aktuális státuszát.
     """
     print("\n[Karbantartó] Adatbázis állapotának ellenőrzése indul...")
 
     async with httpx.AsyncClient() as client:
         try:
-            # Lekérdezzük a fiókhoz tartozó PostgreSQL adatbázisokat
             response = await client.get(f"{RENDER_API_URL}/postgres", headers=HEADERS)
 
             if response.status_code == 200:
                 db_list = response.json()
                 print(f"[Karbantartó] Sikeres lekérdezés! {len(db_list)} adatbázis található.")
 
-                # Itt fogjuk majd kielemezni, hogy lejár-e hamarosan a 30 napos adatbázis
                 for db in db_list:
                     db_info = db.get("postgres", {})
                     print(f" - Név: {db_info.get('name')}, Állapot: {db_info.get('status')}, ID: {db_info.get('id')}")
@@ -224,31 +234,31 @@ async def check_database_status():
 
 
 async def main():
+    """
+    A karbantartó szolgáltatás fő aszinkron eseményhurka.
+    Elindít egy kezdeti biztonsági mentést, majd beütemezi a rendszeres állapotellenőrzést.
+    """
     print("Levendula Karbantartó Rendszer indul...")
 
-    # Aszinkron ütemező létrehozása
+    # Induláskor készítünk egy azonnali biztonsági mentést az aktuális állapotról
+    create_backup()
+
+    # Aszinkron ütemező (APScheduler) konfigurálása és indítása
     scheduler = AsyncIOScheduler()
-
-    # Beállítjuk, hogy a check_database_status függvény 1 percenként lefusson
     scheduler.add_job(check_database_status, 'interval', minutes=1)
-    # Beállítjuk, hogy a perform_database_rotation (A csere) fusson le tesztként, mondjuk 1 perc múlva
-    # scheduler.add_job(perform_database_rotation, 'interval', minutes=2)
-    scheduler.start()
-    print("Időzítő elindítva. Első ellenőrzés 1 perc múlva... Leállítás: Ctrl+C")
+    # Ha élesíteni szeretnéd az automatikus rotációt, vedd ki a kommentet:
+    # scheduler.add_job(perform_database_rotation, 'interval', days=28)
 
-    # Egy végtelen ciklus, ami életben tartja a főprogramot
+    scheduler.start()
+    print("Időzítő elindítva. Első állapotellenőrzés 1 perc múlva... Leállítás: Ctrl+C")
+
+    # Végtelen ciklus, amely életben tartja az aszinkron háttérfolyamatot
     while True:
         await asyncio.sleep(3600)
 
 
-#if __name__ == "__main__":
+if __name__ == "__main__":
     try:
-        # A modern Python belépési pontja
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("\nKarbantartó rendszer leállítva.")
-if __name__ == "__main__":
-    print("Mentés tesztelése indul a felhőből...")
-    mentes_utvonal = create_backup()
-    print(f"Mentés sikeres! Fájl helye: {mentes_utvonal}")
-    asyncio.run(main())
+        print("\nKarbantartó rendszer szabályosan leállítva.")
