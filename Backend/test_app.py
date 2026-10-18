@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
-from Backend.main import app
-from Backend.database import Base, get_db
+from Backend.main import app, get_db
+from Backend.database import Base
 from Backend import models
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
