@@ -241,9 +241,14 @@ async def main():
         await asyncio.sleep(3600)
 
 
-if __name__ == "__main__":
+#if __name__ == "__main__":
     try:
         # A modern Python belépési pontja
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("\nKarbantartó rendszer leállítva.")
+if __name__ == "__main__":
+    print("Mentés tesztelése indul a felhőből...")
+    mentes_utvonal = create_backup()
+    print(f"Mentés sikeres! Fájl helye: {mentes_utvonal}")
+    asyncio.run(main())
