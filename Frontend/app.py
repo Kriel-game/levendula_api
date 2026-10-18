@@ -3,7 +3,8 @@ import requests
 import pandas as pd
 
 # A backend API címe (helyi futtatásnál)
-API_BASE_URL = "http://localhost:8000/api"
+#API_BASE_URL = "http://localhost:8000/api"
+API_BASE_URL = "https://levendula-backend.onrender.com/api"
 
 st.set_page_config(page_title="Levendula Biztonsági Monitor", layout="wide")
 
