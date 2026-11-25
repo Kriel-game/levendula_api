@@ -5,6 +5,7 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
 from Backend.main import app, get_db
+from Backend import main as main_module
 from Backend import models
 from Backend.security_engine import SecurityRuleEngine
 
@@ -128,3 +129,54 @@ def test_api_import_and_retrieve_integration():
 
     # 5. Takarítás: Táblák eldobása, hogy a következő teszt tiszta lappal induljon
     models.Base.metadata.drop_all(bind=test_engine)
+
+
+def test_maintenance_admin_and_probe_write(monkeypatch):
+    models.Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setenv("MAINTENANCE_TOKEN", "test-maintenance-token")
+    monkeypatch.setenv("MAINTENANCE_MODE", "false")
+    monkeypatch.setattr(main_module, "maintenance_mode", False)
+
+    assert client.get("/api/admin/maintenance").status_code == 401
+    assert client.get(
+        "/api/admin/maintenance",
+        headers={"X-Maintenance-Token": "wrong-token"},
+    ).status_code == 401
+    assert client.get(
+        "/api/admin/maintenance",
+        headers={"X-Maintenance-Token": "test-maintenance-token"},
+    ).json() == {"enabled": False}
+
+    enabled = client.post(
+        "/api/admin/maintenance",
+        headers={"X-Maintenance-Token": "test-maintenance-token"},
+        json={"enabled": True},
+    )
+    assert enabled.json() == {"enabled": True}
+    assert client.post(
+        "/api/logs/import",
+        json={"logs": ['192.0.2.1 - - [10/Sep/2026:16:05:12 +0000] "GET /test HTTP/1.1" 200 1']},
+    ).status_code == 503
+
+    probe = client.post(
+        "/api/admin/probe-write",
+        headers={"X-Maintenance-Token": "test-maintenance-token"},
+    )
+    assert probe.status_code == 200
+    assert probe.json()["writable"] is True
+    with TestingSessionLocal() as db:
+        assert db.query(models.SecurityEvent).count() == 0
+
+    client.post(
+        "/api/admin/maintenance",
+        headers={"X-Maintenance-Token": "test-maintenance-token"},
+        json={"enabled": False},
+    )
+
+
+def test_maintenance_admin_requires_server_token(monkeypatch):
+    monkeypatch.delenv("MAINTENANCE_TOKEN", raising=False)
+    assert client.get(
+        "/api/admin/maintenance",
+        headers={"X-Maintenance-Token": "any-token"},
+    ).status_code == 503

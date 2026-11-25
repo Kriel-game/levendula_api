@@ -5,6 +5,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from typing import List, Optional
 import logging
 from typing import NoReturn
+import hmac
+import os
+from fastapi import Header
+from pydantic import BaseModel
 
 from Backend.database import SessionLocal, engine
 from Backend import models
@@ -38,9 +42,14 @@ except SQLAlchemyError as exc:
     raise
 
 app = FastAPI(title="Levendula Vendégház Biztonsági API")
+maintenance_mode = os.getenv("MAINTENANCE_MODE", "").strip().lower() in {"true", "1"}
 
 # Példányosítjuk az OOP szabálymotort, amely a kérések kiértékelését végzi
 sec_engine = SecurityRuleEngine()
+
+
+class MaintenanceRequest(BaseModel):
+    enabled: bool
 
 
 def _raise_database_error(
@@ -69,6 +78,81 @@ def get_db():
         db.close()
 
 
+def _require_maintenance_token(token: Optional[str]) -> None:
+    configured_token = os.getenv("MAINTENANCE_TOKEN")
+    if not configured_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A karbantartási adminisztráció nincs konfigurálva.",
+        )
+    if token is None or not hmac.compare_digest(
+        token.encode("utf-8"), configured_token.encode("utf-8")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Érvénytelen vagy hiányzó karbantartási token.",
+        )
+
+
+def _require_writes_enabled() -> None:
+    if maintenance_mode:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A rendszer karbantartás alatt áll; az írási műveletek átmenetileg tiltottak.",
+        )
+
+
+@app.get("/api/admin/maintenance")
+def get_maintenance_status(
+    maintenance_token: Optional[str] = Header(default=None, alias="X-Maintenance-Token"),
+):
+    _require_maintenance_token(maintenance_token)
+    return {"enabled": maintenance_mode}
+
+
+@app.post("/api/admin/maintenance")
+def set_maintenance_status(
+    request: MaintenanceRequest,
+    maintenance_token: Optional[str] = Header(default=None, alias="X-Maintenance-Token"),
+):
+    global maintenance_mode
+    _require_maintenance_token(maintenance_token)
+    maintenance_mode = request.enabled
+    os.environ["MAINTENANCE_MODE"] = "true" if request.enabled else "false"
+    return {"enabled": maintenance_mode}
+
+
+@app.post("/api/admin/probe-write")
+def probe_write(
+    db: Session = Depends(get_db),
+    maintenance_token: Optional[str] = Header(default=None, alias="X-Maintenance-Token"),
+):
+    _require_maintenance_token(maintenance_token)
+    probe = models.SecurityEvent(
+        ip_address="127.0.0.1",
+        timestamp="maintenance-probe",
+        http_method="PROBE",
+        request_url="/internal/maintenance-probe",
+        status_code=200,
+        severity="Normál",
+        reason="Temporary database write probe",
+    )
+    try:
+        db.add(probe)
+        db.flush()
+        probe_id = probe.id
+        if probe_id is None:
+            raise SQLAlchemyError("Database did not assign a probe ID")
+        db.query(models.SecurityEvent).filter(
+            models.SecurityEvent.id == probe_id
+        ).one()
+        db.delete(probe)
+        db.commit()
+    except SQLAlchemyError as exc:
+        _raise_database_error(db, "Az adatbázis próbaírása nem sikerült.", exc)
+    return {"writable": True, "probe_id": probe_id}
+
+
 # 1. Adatfelvitel és feldolgozás (POST)
 @app.post("/api/logs/import", status_code=status.HTTP_201_CREATED)
 def import_logs(request: schemas.LogImportRequest, db: Session = Depends(get_db)):
@@ -76,6 +160,7 @@ def import_logs(request: schemas.LogImportRequest, db: Session = Depends(get_db)
     Új nyers szervernapló-sorok tömeges beolvasása, kiértékelése és mentése.
     Adatfolyam: Nyers szöveg -> parse_log_line() -> SecurityRuleEngine -> Adatbázis INSERT.
     """
+    _require_writes_enabled()
     imported_count = 0
 
     try:
