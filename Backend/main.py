@@ -1,7 +1,10 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.exc import SQLAlchemyError
 from typing import List, Optional
+import logging
+from typing import NoReturn
 
 from Backend.database import SessionLocal, engine
 from Backend import models
@@ -16,14 +19,40 @@ from Backend.security_engine import SecurityRuleEngine
 # logelemző és a biztonsági motor munkáját, valamint kezeli az adatbázist.
 # =====================================================================
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 # Alkalmazás indulásakor automatikusan létrehozza a 'security_events' táblát
 # az adatbázisban, amennyiben az még nem létezik.
-models.Base.metadata.create_all(bind=engine)
+try:
+    models.Base.metadata.create_all(bind=engine)
+except SQLAlchemyError as exc:
+    logger.exception(
+        "Database initialization failed (%s)",
+        type(exc).__name__,
+        exc_info=(type(exc), Exception(type(exc).__name__), exc.__traceback__),
+    )
+    raise
 
 app = FastAPI(title="Levendula Vendégház Biztonsági API")
 
 # Példányosítjuk az OOP szabálymotort, amely a kérések kiértékelését végzi
 sec_engine = SecurityRuleEngine()
+
+
+def _raise_database_error(
+    db: Session, message: str, exc: SQLAlchemyError
+) -> NoReturn:
+    db.rollback()
+    logger.exception(
+        "Database operation failed (%s)",
+        type(exc).__name__,
+        exc_info=(type(exc), Exception(type(exc).__name__), exc.__traceback__),
+    )
+    raise HTTPException(status_code=500, detail=message) from None
 
 
 def get_db():
@@ -49,30 +78,33 @@ def import_logs(request: schemas.LogImportRequest, db: Session = Depends(get_db)
     """
     imported_count = 0
 
-    for line in request.logs:
-        # 1. lépés: Szöveges naplósor felbontása mezőkre (funkcionális modul)
-        parsed_data = parse_log_line(line)
+    try:
+        for line in request.logs:
+            # 1. lépés: Szöveges naplósor felbontása mezőkre (funkcionális modul)
+            parsed_data = parse_log_line(line)
 
-        if parsed_data:
-            # 2. lépés: Biztonsági kockázat kiértékelése (OOP szabálymotor)
-            evaluated_data = sec_engine.evaluate_request(parsed_data)
+            if parsed_data:
+                # 2. lépés: Biztonsági kockázat kiértékelése (OOP szabálymotor)
+                evaluated_data = sec_engine.evaluate_request(parsed_data)
 
-            # 3. lépés: SQLAlchemy ORM modell példányosítása a mentéshez
-            db_event = models.SecurityEvent(
-                ip_address=evaluated_data["ip"],
-                timestamp=evaluated_data["timestamp"],
-                http_method=evaluated_data["method"],
-                request_url=evaluated_data["url"],
-                status_code=evaluated_data["status"],
-                severity=evaluated_data["severity"],
-                reason=evaluated_data["reason"]
-            )
-            db.add(db_event)
-            imported_count += 1
+                # 3. lépés: SQLAlchemy ORM modell példányosítása a mentéshez
+                db_event = models.SecurityEvent(
+                    ip_address=evaluated_data["ip"],
+                    timestamp=evaluated_data["timestamp"],
+                    http_method=evaluated_data["method"],
+                    request_url=evaluated_data["url"],
+                    status_code=evaluated_data["status"],
+                    severity=evaluated_data["severity"],
+                    reason=evaluated_data["reason"]
+                )
+                db.add(db_event)
+                imported_count += 1
 
-    # Csak akkor véglegesítjük a tranzakciót, ha volt érvényes feldolgozott sor
-    if imported_count > 0:
-        db.commit()
+        # Csak akkor véglegesítjük a tranzakciót, ha volt érvényes feldolgozott sor
+        if imported_count > 0:
+            db.commit()
+    except SQLAlchemyError as exc:
+        _raise_database_error(db, "Az események mentése nem sikerült.", exc)
 
     return {"message": f"{imported_count} darab esemény sikeresen importálva és kiértékelve."}
 
@@ -84,13 +116,16 @@ def get_events(severity: Optional[str] = None, limit: int = 100, db: Session = D
     Kiértékelt biztonsági események lekérdezése időrendben visszafelé (legfrissebb elöl).
     Opcionálisan szűrhető riasztási szint (severity) alapján query paraméterrel.
     """
-    query = db.query(models.SecurityEvent)
+    try:
+        query = db.query(models.SecurityEvent)
 
-    if severity:
-        query = query.filter(models.SecurityEvent.severity == severity)
+        if severity:
+            query = query.filter(models.SecurityEvent.severity == severity)
 
-    # Csökkenő sorrend ID alapján, legfeljebb 'limit' darab találat visszaadása
-    events = query.order_by(models.SecurityEvent.id.desc()).limit(limit).all()
+        # Csökkenő sorrend ID alapján, legfeljebb 'limit' darab találat visszaadása
+        events = query.order_by(models.SecurityEvent.id.desc()).limit(limit).all()
+    except SQLAlchemyError as exc:
+        _raise_database_error(db, "Az események lekérdezése nem sikerült.", exc)
 
     if not events:
         raise HTTPException(status_code=404, detail="Nem található a feltételeknek megfelelő esemény.")
@@ -105,10 +140,13 @@ def get_stats_summary(db: Session = Depends(get_db)):
     Összesíti az események darabszámát riasztási szintek szerint (SQL GROUP BY + COUNT).
     A Streamlit dashboard ebből a végpontból rajzolja ki a megoszlási oszlopdiagramot.
     """
-    stats = db.query(
-        models.SecurityEvent.severity,
-        func.count(models.SecurityEvent.id).label('count')
-    ).group_by(models.SecurityEvent.severity).all()
+    try:
+        stats = db.query(
+            models.SecurityEvent.severity,
+            func.count(models.SecurityEvent.id).label('count')
+        ).group_by(models.SecurityEvent.severity).all()
+    except SQLAlchemyError as exc:
+        _raise_database_error(db, "A statisztika lekérdezése nem sikerült.", exc)
 
     return [{"severity": stat.severity, "count": stat.count} for stat in stats]
 
@@ -120,7 +158,12 @@ def get_events_by_ip(ip_address: str, db: Session = Depends(get_db)):
     Egy konkrét IP-címhez tartozó összes naplózott tevékenység lekérése.
     Útvonal-paraméterként (path parameter) kapja meg a keresett IP-címet.
     """
-    events = db.query(models.SecurityEvent).filter(models.SecurityEvent.ip_address == ip_address).all()
+    try:
+        events = db.query(models.SecurityEvent).filter(
+            models.SecurityEvent.ip_address == ip_address
+        ).all()
+    except SQLAlchemyError as exc:
+        _raise_database_error(db, "Az IP-címhez tartozó események lekérdezése nem sikerült.", exc)
 
     if not events:
         raise HTTPException(status_code=404, detail=f"Nem található bejegyzés a(z) {ip_address} IP-címhez.")

@@ -1,6 +1,10 @@
+import os
+
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 import requests
 import pandas as pd
+
 
 # =====================================================================
 # STREAMLIT FRONTEND (INTERAKTÍV BIZTONSÁGI DASHBOARD)
@@ -10,7 +14,14 @@ import pandas as pd
 # grafikus (oszlopdiagram) formában jeleníti meg az üzemeltetőnek.
 # =====================================================================
 
-API_BASE_URL = "https://levendula-backend.onrender.com/api"
+try:
+    API_BASE_URL = (
+        os.getenv("API_BASE_URL")
+        or st.secrets.get("API_BASE_URL")
+        or "http://localhost:8000/api"
+    )
+except (FileNotFoundError, KeyError, StreamlitSecretNotFoundError):
+    API_BASE_URL = os.getenv("API_BASE_URL") or "http://localhost:8000/api"
 
 # Egyedi User-Agent fejléc megadása:
 # A Render előtti Cloudflare védelem (WAF) gyakran 403 Forbidden hibával
