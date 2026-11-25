@@ -41,7 +41,7 @@ class SecurityRuleEngine:
         # 1. Szabály: SQL Injekció vizsgálata (Adatbázis manipulációs kísérletek)
         for pattern in self.sqli_patterns:
             if pattern in url_upper:
-                return self._generate_alert(log_data, "Alacsony", "SQL Injekció gyanú")
+                return self._generate_alert(log_data, "Kritikus", "SQL Injekció gyanú")
 
         # 2. Szabály: XSS (Cross-Site Scripting) vizsgálata (Kliensoldali szkript befecskendezés)
         for pattern in self.xss_patterns:
