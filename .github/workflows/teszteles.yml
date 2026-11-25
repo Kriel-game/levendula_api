@@ -3,15 +3,13 @@ name: Levendula Vendégház Biztonsági API Tesztelés
 # =====================================================================
 # CI/CD (Continuous Integration) KONFIGURÁCIÓ
 # Szerepe: Minden alkalommal, amikor új kód kerül fel (push vagy pull_request)
-# a GitHub 'main' vagy 'master' ágára, egy tiszta felhős Ubuntu szerveren
+# bármelyik ágra vagy pull requestre, egy tiszta felhős Ubuntu szerveren
 # automatikusan lefuttatja a Pytest egység- és integrációs teszteket.
 # =====================================================================
 
 on:
   push:
-    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main", "master" ]
 
 jobs:
   test:
@@ -32,7 +30,7 @@ jobs:
     - name: Függőségek telepítése
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        python -m pip install -r requirements.txt
 
     # 4. Automatizált tesztek futtatása izolált környezetben
     # A PYTHONPATH: . biztosítja, hogy a 'Backend.*' abszolút importok működjenek.
@@ -41,6 +39,8 @@ jobs:
     - name: Pytest futtatása
       env:
         PYTHONPATH: .
-        DATABASE_URL: "sqlite:///./test.db"
+        DATABASE_URL: "sqlite:///./ci_test.db"
+        PYTHON_DOTENV_DISABLED: "1"
+        MAINTENANCE_TOKEN: "pytest-only-maintenance-token"
       run: |
-        python -m pytest
+        python -m pytest -v

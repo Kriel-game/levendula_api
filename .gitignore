@@ -5,4 +5,7 @@ __pycache__/
 .env
 Backend/.env
 *.db
+ci_test.db
+Karbantarto/rotation_state.json
+Karbantarto/rotation.lock
 .streamlit/secrets.toml
