@@ -29,6 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Adatbázis-indítás és FastAPI-alkalmazás
 # Alkalmazás indulásakor automatikusan létrehozza a 'security_events' táblát
 # az adatbázisban, amennyiben az még nem létezik.
 try:
@@ -49,12 +50,15 @@ sec_engine = SecurityRuleEngine()
 
 
 class MaintenanceRequest(BaseModel):
+    """A karbantartási mód be- vagy kikapcsolására szolgáló kérésmodell."""
+
     enabled: bool
 
 
 def _raise_database_error(
     db: Session, message: str, exc: SQLAlchemyError
 ) -> NoReturn:
+    """Visszagörgeti a tranzakciót, naplóz, majd API-hibát jelez."""
     db.rollback()
     logger.exception(
         "Database operation failed (%s)",
@@ -78,7 +82,9 @@ def get_db():
         db.close()
 
 
+# Hitelesítés és karbantartási adminisztráció
 def _require_maintenance_token(token: Optional[str]) -> None:
+    """Ellenőrzi a karbantartási végpontokhoz szükséges tokent."""
     configured_token = os.getenv("MAINTENANCE_TOKEN")
     if not configured_token:
         raise HTTPException(
@@ -95,6 +101,7 @@ def _require_maintenance_token(token: Optional[str]) -> None:
 
 
 def _require_writes_enabled() -> None:
+    """Megakadályozza az írási műveleteket aktív karbantartás esetén."""
     if maintenance_mode:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -106,6 +113,7 @@ def _require_writes_enabled() -> None:
 def get_maintenance_status(
     maintenance_token: Optional[str] = Header(default=None, alias="X-Maintenance-Token"),
 ):
+    """Hitelesítés után visszaadja a karbantartási mód aktuális állapotát."""
     _require_maintenance_token(maintenance_token)
     return {"enabled": maintenance_mode}
 
@@ -115,6 +123,7 @@ def set_maintenance_status(
     request: MaintenanceRequest,
     maintenance_token: Optional[str] = Header(default=None, alias="X-Maintenance-Token"),
 ):
+    """Átállítja a karbantartási módot, és visszaadja az állapotát."""
     global maintenance_mode
     _require_maintenance_token(maintenance_token)
     maintenance_mode = request.enabled
@@ -127,6 +136,7 @@ def probe_write(
     db: Session = Depends(get_db),
     maintenance_token: Optional[str] = Header(default=None, alias="X-Maintenance-Token"),
 ):
+    """Próbabejegyzéssel ellenőrzi az adatbázis írhatóságát."""
     _require_maintenance_token(maintenance_token)
     probe = models.SecurityEvent(
         ip_address="127.0.0.1",
@@ -153,6 +163,7 @@ def probe_write(
     return {"writable": True, "probe_id": probe_id}
 
 
+# Naplóimport és biztonsági események
 # 1. Adatfelvitel és feldolgozás (POST)
 @app.post("/api/logs/import", status_code=status.HTTP_201_CREATED)
 def import_logs(request: schemas.LogImportRequest, db: Session = Depends(get_db)):

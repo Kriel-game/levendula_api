@@ -1,3 +1,5 @@
+"""A backend API, a szabálymotor és az adatbázis-karbantartás tesztjei."""
+
 import asyncio
 import json
 import os
@@ -15,8 +17,10 @@ from Backend.security_engine import SecurityRuleEngine
 from Karbantarto import karbantarto as maintenance
 
 
+# Tesztkörnyezet és adatbázis-fixture
 @pytest.fixture
 def api_database(tmp_path, monkeypatch):
+    """Izolált SQLite-adatbázissal és tesztklienssel készíti elő az API-t."""
     database_path = tmp_path / "api_test.sqlite"
     test_engine = create_engine(
         f"sqlite:///{database_path.as_posix()}",
@@ -41,6 +45,7 @@ def api_database(tmp_path, monkeypatch):
     test_engine.dispose()
 
 
+# A biztonsági szabálymotor egységtesztjei
 @pytest.mark.parametrize(
     "url, expected_severity, expected_reason",
     [
@@ -53,6 +58,7 @@ def api_database(tmp_path, monkeypatch):
 def test_rule_engine_normal_boundary_and_encoded_inputs(
     url, expected_severity, expected_reason
 ):
+    """Ellenőrzi a tiszta, üres és kódolt kérések várt besorolását."""
     result = SecurityRuleEngine().evaluate_request({"url": url})
     assert result["severity"] == expected_severity
     assert result["reason"] == expected_reason
@@ -71,6 +77,7 @@ def test_rule_engine_normal_boundary_and_encoded_inputs(
     ],
 )
 def test_rule_engine_attack_cases(malicious_url, expected_severity, expected_reason):
+    """Ellenőrzi, hogy a támadási mintákhoz a megfelelő riasztás tartozik."""
     result = SecurityRuleEngine().evaluate_request(
         {
             "ip": "10.0.0.1",
@@ -85,12 +92,15 @@ def test_rule_engine_attack_cases(malicious_url, expected_severity, expected_rea
 
 
 def test_rule_engine_invalid_input():
+    """Hiányos bemenet esetén a motor hibás eredményét ellenőrzi."""
     result = SecurityRuleEngine().evaluate_request({"ip": "127.0.0.1", "method": "GET"})
     assert result["severity"] == "Hiba"
     assert result["reason"] == "Érvénytelen vagy hiányzó bemenet"
 
 
+# API-integrációs és karbantartási mód tesztjei
 def test_api_import_and_retrieve_integration(api_database):
+    """Ellenőrzi a naplóimportot, lekérdezést és adatbázisba mentést."""
     client, session_factory = api_database
     raw_log = (
         '192.168.1.1 - - [10/Sep/2026:16:05:12 +0200] '
@@ -117,6 +127,7 @@ def test_api_import_and_retrieve_integration(api_database):
 
 
 def test_maintenance_admin_and_probe_write(api_database, monkeypatch):
+    """Ellenőrzi a karbantartási végpont hitelesítését és próbaírását."""
     client, session_factory = api_database
     token = "pytest-maintenance-token"
     monkeypatch.setenv("MAINTENANCE_TOKEN", token)
@@ -158,6 +169,7 @@ def test_maintenance_admin_and_probe_write(api_database, monkeypatch):
 
 
 def test_maintenance_admin_requires_server_token(api_database, monkeypatch):
+    """Szerveroldali token nélkül az adminisztráció nem érhető el."""
     client, _ = api_database
     monkeypatch.delenv("MAINTENANCE_TOKEN", raising=False)
     response = client.get(
@@ -167,7 +179,9 @@ def test_maintenance_admin_requires_server_token(api_database, monkeypatch):
     assert response.status_code == 503
 
 
+# Mockolt karbantartói és Render API-tesztek
 def test_render_api_retries_transient_responses(monkeypatch):
+    """Ellenőrzi az API újrapróbálkozását átmeneti HTTP-hiba után."""
     statuses = [429, 503, 200]
     request_count = 0
 
@@ -182,6 +196,7 @@ def test_render_api_retries_transient_responses(monkeypatch):
     monkeypatch.setattr(maintenance.asyncio, "sleep", no_wait)
 
     async def run():
+        # A MockTransport hálózat nélkül ad rögzített válaszokat.
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             api = maintenance.RenderAPI("test-api-key", client)
             response = await api.request("GET", "/postgres")
@@ -193,6 +208,7 @@ def test_render_api_retries_transient_responses(monkeypatch):
 
 @pytest.mark.parametrize("status_code", [401, 403])
 def test_render_api_stops_immediately_on_authorization_error(status_code):
+    """Ellenőrzi, hogy jogosultsági hibára az API ismétlés nélkül leáll."""
     request_count = 0
 
     async def handler(_):
@@ -201,6 +217,7 @@ def test_render_api_stops_immediately_on_authorization_error(status_code):
         return httpx.Response(status_code)
 
     async def run():
+        # A mock a jogosultsági hibát hálózati hívás nélkül szimulálja.
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             api = maintenance.RenderAPI("test-api-key", client)
             with pytest.raises(maintenance.RotationError):
@@ -211,6 +228,7 @@ def test_render_api_stops_immediately_on_authorization_error(status_code):
 
 
 def test_render_api_stops_after_retry_limit(monkeypatch):
+    """Ellenőrzi, hogy tartós hiba esetén korlátos az újrapróbálkozás."""
     request_count = 0
 
     async def handler(_):
@@ -224,6 +242,7 @@ def test_render_api_stops_after_retry_limit(monkeypatch):
     monkeypatch.setattr(maintenance.asyncio, "sleep", no_wait)
 
     async def run():
+        # A MockTransport minden kérésre 503-at ad a korlát teszteléséhez.
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             api = maintenance.RenderAPI("test-api-key", client)
             with pytest.raises(maintenance.RotationError):
@@ -235,6 +254,7 @@ def test_render_api_stops_after_retry_limit(monkeypatch):
 
 @pytest.mark.parametrize("backup_state", ["missing", "corrupt"])
 def test_restore_rejects_missing_or_corrupt_backup(tmp_path, backup_state):
+    """Hiányzó vagy sérült mentésből nem jön létre adatbázis."""
     backup_path = tmp_path / "untrusted-backup.json"
     if backup_state == "corrupt":
         backup_path.write_text("{not-json", encoding="utf-8")
@@ -253,8 +273,10 @@ def test_restore_rejects_missing_or_corrupt_backup(tmp_path, backup_state):
 def test_resume_discovers_created_database_without_creating_another(
     tmp_path, monkeypatch
 ):
+    """Folytatáskor megtalálja a mentett adatbázist, duplikálás nélkül."""
     state_path = tmp_path / "rotation_state.json"
     monkeypatch.setattr(maintenance, "STATE_PATH", state_path)
+    # Az izolált állapotfájl egy félbeszakadt adatbázis-létrehozást modellez.
     state = {
         "phase": "creating_database",
         "new_db_name": "pytest-recovery-db",
@@ -263,10 +285,14 @@ def test_resume_discovers_created_database_without_creating_another(
     maintenance._save_state(state)
 
     class MockRenderAPI:
+        """A tesztállapothoz illeszkedő Render-listaválaszt szimulálja."""
+
         def __init__(self):
+            """Létrehozza a hívásokat rögzítő mockot."""
             self.calls = []
 
         async def request(self, method, path, **kwargs):
+            """Visszaadja a meglévő adatbázist tartalmazó mockválaszt."""
             self.calls.append((method, path))
             return httpx.Response(
                 200,
@@ -330,6 +356,7 @@ def test_resume_discovers_created_database_without_creating_another(
 def test_rotation_failure_keeps_maintenance_enabled(
     tmp_path, monkeypatch, failure_point
 ):
+    """Visszaállítási és utóellenőrzési hibánál aktív marad a karbantartás."""
     state_path = tmp_path / "rotation_state.json"
     lock_path = tmp_path / "rotation.lock"
     backup_path = tmp_path / "backup.json"
@@ -342,6 +369,7 @@ def test_rotation_failure_keeps_maintenance_enabled(
         ),
         encoding="utf-8",
     )
+    # A mentett állapot a csere adott fázisában bekövetkező hibát modellezi.
     state = {
         "phase": "database_created" if failure_point == "restore" else "backend_deployed",
         "source_db_id": "dpg-source-test",
@@ -376,10 +404,14 @@ def test_rotation_failure_keeps_maintenance_enabled(
     monkeypatch.setenv("BACKUP_DIR", str(tmp_path))
 
     class MockRenderAPI:
+        """A rotáció tesztjéhez szükséges Render-végpontokat szimulálja."""
+
         def __init__(self, *_):
+            """Inicializálja a mockhívások naplóját."""
             self.calls = []
 
         async def request(self, method, path, **kwargs):
+            """A cserefolyamathoz illő Render-válaszokat ad."""
             self.calls.append((method, path, kwargs))
             if path == "/postgres":
                 return httpx.Response(200, json=[])

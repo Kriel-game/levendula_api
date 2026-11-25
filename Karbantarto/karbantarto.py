@@ -1,3 +1,5 @@
+"""Biztonságos Render-adatbázis-ellenőrző, mentő és cserélő segédprogram."""
+
 import argparse
 import asyncio
 import json
@@ -17,7 +19,9 @@ from sqlalchemy.orm import sessionmaker
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-# The maintenance utility must use explicitly supplied process environment only.
+# Konfiguráció, naplózás és titokszűrés
+# A karbantartó segédprogram kizárólag a folyamatnak átadott
+# környezeti változókat használhatja.
 os.environ["PYTHON_DOTENV_DISABLED"] = "true"
 
 from Backend.database import Base, SessionLocal  # noqa: E402
@@ -39,12 +43,19 @@ POLL_INTERVAL_SECONDS = 5
 ROTATION_TIMEOUT_SECONDS = 600
 
 
+# Hiba- és Render API-kezelés
 class RotationError(RuntimeError):
-    """A safe-to-display rotation failure without response secrets."""
+    """Biztonságosan megjeleníthető rotációs hiba.
+
+    Nem tartalmaz válaszadatokból származó titkokat.
+    """
 
 
 class RenderAPI:
+    """Titokszűrt, újrapróbálkozó aszinkron kliens a Render API-hoz."""
+
     def __init__(self, api_key, client=None):
+        """Létrehozza a hitelesített Render API-klienst."""
         if not api_key:
             raise RotationError("A Render API-kulcs nincs konfigurálva.")
         self.headers = {
@@ -54,6 +65,7 @@ class RenderAPI:
         self.client = client
 
     async def request(self, method, path, *, json_body=None, allow_statuses=()):
+        """Kérést küld, és kezeli a hibákat, illetve az ismétlést."""
         retryable = not (method.upper() == "POST" and path == "/postgres")
         last_error = None
         for attempt in range(MAX_RETRIES):
@@ -69,6 +81,7 @@ class RenderAPI:
                 last_error = exc
                 if attempt + 1 == MAX_RETRIES or not retryable:
                     raise RotationError("A Render API-kérés időtúllépés miatt sikertelen.") from None
+                # Az ismételhető kérések növekvő várakozással ismétlődnek.
                 await asyncio.sleep(2**attempt)
                 continue
             except httpx.RequestError as exc:
@@ -82,6 +95,7 @@ class RenderAPI:
                 return response
             if response.status_code == 429 or 500 <= response.status_code <= 599:
                 if (response.status_code == 429 or retryable) and attempt + 1 < MAX_RETRIES:
+                    # A szerver Retry-After értéke legfeljebb 10 másodperc.
                     retry_after = response.headers.get("Retry-After")
                     try:
                         delay = min(max(float(retry_after), 0), 10) if retry_after else 2**attempt
@@ -103,11 +117,14 @@ class RenderAPI:
         raise RotationError("A Render API-kérés az újrapróbálkozások után sem sikerült.") from last_error
 
 
+# Időbélyegek, rekordok és biztonsági mentések
 def _utc_now():
+    """Visszaadja az aktuális időpontot UTC-időzónában."""
     return datetime.now(timezone.utc)
 
 
 def _parse_utc(value):
+    """ISO-formátumú értéket alakít UTC-időponttá, különben None-t ad."""
     if not value:
         return None
     try:
@@ -120,6 +137,7 @@ def _parse_utc(value):
 
 
 def _as_utc_timestamp(value):
+    """A mentésben használt időbélyeget egységes UTC-formára alakítja."""
     parsed = _parse_utc(value)
     if parsed:
         return parsed.isoformat().replace("+00:00", "Z")
@@ -133,6 +151,7 @@ def _as_utc_timestamp(value):
 
 
 def _event_dict(event):
+    """Az adatbázis-eseményt menthető, normalizált szótárrá alakítja."""
     return {
         "id": event.id,
         "ip_address": event.ip_address,
@@ -146,6 +165,7 @@ def _event_dict(event):
 
 
 def _read_backup(backup_path):
+    """Beolvassa és ellenőrzi a mentés metaadatait és rekordjait."""
     with open(backup_path, "r", encoding="utf-8") as backup_file:
         payload = json.load(backup_file)
     if isinstance(payload, list):
@@ -182,7 +202,10 @@ def _read_backup(backup_path):
 
 
 def create_backup(source_db_id=None, backup_dir=None):
-    """Write a complete, metadata-bearing snapshot without logging record data."""
+    """Teljes, metaadatokat tartalmazó pillanatkép készítése.
+
+    A rekordadatokat nem naplózza.
+    """
     directory = Path(backup_dir or os.getenv("BACKUP_DIR", Path(__file__).parent / "backups"))
     directory.mkdir(parents=True, exist_ok=True)
     db = SessionLocal()
@@ -208,7 +231,10 @@ def create_backup(source_db_id=None, backup_dir=None):
 
 
 def restore_backup(backup_path, new_db_url):
-    """Create schema, restore typed rows, and align PostgreSQL's serial sequence."""
+    """Séma létrehozása és típushelyes rekordok visszaállítása.
+
+    A PostgreSQL-szekvenciát is összehangolja.
+    """
     metadata, events = _read_backup(backup_path)
     target_engine = create_engine(
         new_db_url,
@@ -242,6 +268,7 @@ def restore_backup(backup_path, new_db_url):
                 )
             db.commit()
         if target_engine.dialect.name == "postgresql":
+            # A PostgreSQL-szekvenciát a legnagyobb ID-hoz igazítjuk.
             db.execute(
                 text(
                     "SELECT setval(pg_get_serial_sequence('security_events', 'id'), "
@@ -262,7 +289,7 @@ def restore_backup(backup_path, new_db_url):
 
 
 def verify_restored_data(backup_path, database_url):
-    """Compare every stored field and recompute the engine's severity/reason."""
+    """Ellenőrzi a visszaállított mezőket és a szabálymotor eredményét."""
     _, expected = _read_backup(backup_path)
     verify_engine = create_engine(
         database_url,
@@ -287,7 +314,7 @@ def verify_restored_data(backup_path, database_url):
                     "status": record["status_code"],
                 }
             )
-            # The current schema stores event_type as `reason`.
+            # A jelenlegi séma a `reason` mezőben tárolja az esemény típusát.
             if evaluated["severity"] != record["severity"] or evaluated["reason"] != record["reason"]:
                 logger.error("A visszaállított rekord szabálymotor-eredménye eltér a tárolt értéktől.")
                 return False
@@ -296,7 +323,9 @@ def verify_restored_data(backup_path, database_url):
         verify_engine.dispose()
 
 
+# Zárolás és tartós állapotfájl-kezelés
 def _load_state():
+    """Beolvassa és ellenőrzi a rotáció állapotfájlját."""
     if not STATE_PATH.exists():
         return {}
     with open(STATE_PATH, "r", encoding="utf-8") as state_file:
@@ -307,6 +336,7 @@ def _load_state():
 
 
 def _save_state(state):
+    """Atomi fájlcserével, tartósan menti a rotáció aktuális állapotát."""
     temporary_path = STATE_PATH.with_suffix(".tmp")
     with open(temporary_path, "w", encoding="utf-8") as state_file:
         json.dump(state, state_file, ensure_ascii=False, indent=2)
@@ -316,6 +346,7 @@ def _save_state(state):
 
 
 def _pid_is_running(pid):
+    """Megállapítja, hogy fut-e folyamat a megadott folyamatazonosítóval."""
     try:
         os.kill(int(pid), 0)
         return True
@@ -324,6 +355,7 @@ def _pid_is_running(pid):
 
 
 def _acquire_lock():
+    """Kizárólagos zárolást szerez, és eltávolítja a beragadt zárolást."""
     if LOCK_PATH.exists():
         try:
             with open(LOCK_PATH, "r", encoding="utf-8") as lock_file:
@@ -342,6 +374,7 @@ def _acquire_lock():
 
 
 def _release_lock():
+    """Eltávolítja a saját folyamathoz tartozó zárolófájlt."""
     try:
         with open(LOCK_PATH, "r", encoding="utf-8") as lock_file:
             lock = json.load(lock_file)
@@ -351,7 +384,9 @@ def _release_lock():
         logger.error("A rotációs zárolófájl nem távolítható el; kézi ellenőrzés szükséges.")
 
 
+# Konfiguráció és adatbázis-kapcsolatok ellenőrzése
 def _require_config(name):
+    """Lekéri a kötelező környezeti beállítást, vagy érthető hibát jelez."""
     value = os.getenv(name)
     if not value:
         raise RotationError(f"Hiányzó konfiguráció: {name}.")
@@ -359,6 +394,7 @@ def _require_config(name):
 
 
 def _backup_directory():
+    """Létrehozza és íráspróbával ellenőrzi a mentési könyvtárat."""
     path = Path(os.getenv("BACKUP_DIR", Path(__file__).parent / "backups"))
     path.mkdir(parents=True, exist_ok=True)
     if not path.is_dir():
@@ -372,6 +408,7 @@ def _backup_directory():
 
 
 def _verify_source_database_connection():
+    """Ellenőrzi, hogy a forrás-adatbázis lekérdezhető-e."""
     db = SessionLocal()
     try:
         db.execute(text("SELECT 1"))
@@ -384,22 +421,26 @@ def _verify_source_database_connection():
 
 
 def _database_entries(payload):
+    """Egységesíti a Render adatbázis-listájának válaszelemeit."""
     if not isinstance(payload, list):
         raise RotationError("A Render adatbázis-lista válasza érvénytelen.")
     return [entry.get("postgres", entry) for entry in payload if isinstance(entry, dict)]
 
 
 async def _list_databases(api):
+    """Lekéri a Render-fiók adatbázisainak listáját."""
     response = await api.request("GET", "/postgres")
     return _database_entries(response.json())
 
 
 async def _find_database(api, database_id):
+    """Azonosító alapján megkeresi az adatbázist a Render listájában."""
     databases = await _list_databases(api)
     return next((entry for entry in databases if entry.get("id") == database_id), None)
 
 
 def _extract_env_variables(payload):
+    """A Render válaszából kulcs-érték szótárat készít."""
     items = payload.get("envVars", payload) if isinstance(payload, dict) else payload
     if not isinstance(items, list):
         raise RotationError("A backend környezeti változóinak válasza érvénytelen.")
@@ -412,7 +453,9 @@ def _extract_env_variables(payload):
     return variables
 
 
+# Állapotellenőrzés és aszinkron Render-műveletek
 async def check_database_status():
+    """Lekéri és naplózza az adatbázisok állapotát és tervezett dátumait."""
     api_key = os.getenv("RENDER_API_KEY")
     if not api_key:
         logger.error("A Render API-kulcs nincs beállítva; az állapotellenőrzés nem futtatható.")
@@ -442,6 +485,7 @@ async def check_database_status():
 
 
 async def _set_backend_maintenance(api, service_id, backend_url, token, enabled):
+    """A backend karbantartási módját és a Render-beállítást is módosítja."""
     headers = {"X-Maintenance-Token": token}
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         response = await client.post(
@@ -464,6 +508,7 @@ async def _set_backend_maintenance(api, service_id, backend_url, token, enabled)
 
 
 async def _start_deploy(api, service_id):
+    """Elindítja a backend telepítését, és visszaadja annak azonosítóját."""
     response = await api.request(
         "POST",
         f"/services/{service_id}/deploys",
@@ -477,6 +522,7 @@ async def _start_deploy(api, service_id):
 
 
 async def _wait_for_deploy(api, service_id, deploy_id):
+    """A megadott telepítés sikeres éles állapotáig vár, határidővel."""
     deadline = time.monotonic() + ROTATION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         response = await api.request("GET", f"/services/{service_id}/deploys/{deploy_id}")
@@ -490,6 +536,7 @@ async def _wait_for_deploy(api, service_id, deploy_id):
 
 
 async def _restore_maintenance_mode(api, service_id, backend_url, token):
+    """Hiba esetén bekapcsolja a karbantartást a backendben és a Renderben."""
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         response = await client.post(
             f"{backend_url.rstrip('/')}/api/admin/maintenance",
@@ -519,6 +566,7 @@ async def _restore_maintenance_mode(api, service_id, backend_url, token):
 
 
 async def _wait_database_deleted(api, database_id):
+    """Megvárja a régi adatbázis törlését vagy inaktívvá válását."""
     deadline = time.monotonic() + ROTATION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         response = await api.request(
@@ -534,6 +582,7 @@ async def _wait_database_deleted(api, database_id):
 
 
 async def _create_or_recover_database(api, state, owner_id, plan, region, postgres_version):
+    """Létrehozza, vagy azonosítja a már korábban létrehozott adatbázist."""
     if state.get("new_db_id"):
         return state["new_db_id"], state.get("new_db_details", {})
     name = state.get("new_db_name")
@@ -543,6 +592,7 @@ async def _create_or_recover_database(api, state, owner_id, plan, region, postgr
         state["phase"] = "creating_database"
         _save_state(state)
     else:
+        # A mentett nevet keressük, hogy folytatáskor ne jöjjön létre másolat.
         matching = [item for item in await _list_databases(api) if item.get("name") == name]
         if len(matching) == 1 and matching[0].get("id"):
             state["new_db_id"] = matching[0]["id"]
@@ -593,6 +643,7 @@ async def _create_or_recover_database(api, state, owner_id, plan, region, postgr
 
 
 async def _wait_database_available(api, database_id):
+    """Megvárja az új adatbázis elérhetőségét, és jelzi a hibás állapotot."""
     deadline = time.monotonic() + ROTATION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         response = await api.request("GET", f"/postgres/{database_id}")
@@ -607,6 +658,7 @@ async def _wait_database_available(api, database_id):
 
 
 def _connection_strings(database):
+    """Ellenőrzi és egységesíti az adatbázis kapcsolati URL-jeit."""
     connection_info = database.get("connectionInfo", {})
     internal_url = connection_info.get("internalConnectionString")
     external_url = connection_info.get("externalConnectionString") or internal_url
@@ -619,6 +671,7 @@ def _connection_strings(database):
 
 
 def _verify_backup_locally(backup_path):
+    """Ideiglenes SQLite-adatbázisba állítja vissza és ellenőrzi a mentést."""
     with tempfile.TemporaryDirectory(prefix="levendula-rotation-") as directory:
         db_path = Path(directory) / "restore_check.sqlite"
         sqlite_url = "sqlite:///" + db_path.as_posix()
@@ -628,6 +681,7 @@ def _verify_backup_locally(backup_path):
 
 
 async def _verify_live_backend(backend_url, token, backup_path):
+    """Ellenőrzi az éles adatok egyezését és az írási végpontok működését."""
     _, expected = _read_backup(backup_path)
     headers = {"X-Maintenance-Token": token}
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -662,10 +716,11 @@ async def _verify_live_backend(backend_url, token, backup_path):
             )
 
 
+# Ötlépéses adatbázis-csere és vészhelyzeti helyreállítás
 async def perform_database_rotation(
     *, source_db_id=None, allow_delete=None, recover_from_backup=None, allow_recovery=False, resume=False
 ):
-    """Run a durable, explicitly authorized five-step database rotation."""
+    """Végrehajtja az engedélyezett, tartós állapotú adatbáziscserét."""
     _acquire_lock()
     try:
         api_key = _require_config("RENDER_API_KEY")
@@ -762,6 +817,8 @@ async def perform_database_rotation(
                 raise RotationError("A rotációhoz szükséges mentés hiányzik.")
             _read_backup(backup_path)
             if state["phase"] == "backup_complete":
+                # A mentést helyileg állítjuk vissza és ellenőrizzük, mielőtt
+                # a forrás-adatbázis törölhetővé válik.
                 _verify_backup_locally(backup_path)
                 state["phase"] = "locally_verified"
                 _save_state(state)
@@ -858,6 +915,8 @@ async def perform_database_rotation(
                     state["completed_at_utc"] = _utc_now().isoformat()
                     _save_state(state)
                 except Exception as exc:
+                    # Hiba esetén a karbantartás aktív marad a helyreállítás
+                    # sikeres ellenőrzéséig.
                     try:
                         await _restore_maintenance_mode(
                             api, service_id, backend_url, maintenance_token
@@ -877,7 +936,9 @@ async def perform_database_rotation(
         _release_lock()
 
 
+# CLI-vezérlés és ütemezett állapotellenőrzés
 async def _run_schedule():
+    """A konfigurált időközönként, csak olvasással ellenőrzi az állapotot."""
     try:
         interval = max(1, int(os.getenv("CHECK_INTERVAL_MINUTES", "1")))
     except ValueError:
@@ -888,6 +949,7 @@ async def _run_schedule():
 
 
 def _parse_args():
+    """Létrehozza és beolvassa a parancssori kapcsolókat."""
     parser = argparse.ArgumentParser(description="Levendula adatbázis-karbantartó")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-only", action="store_true", help="Csak állapotellenőrzés; nem módosít.")
@@ -902,6 +964,7 @@ def _parse_args():
 
 
 async def _main(args):
+    """A parancssori mód alapján ellenőrzést, ütemezést vagy cserét indít."""
     if args.check_only and (args.resume or args.recover_from_backup or args.allow_delete):
         raise RotationError("A --check-only nem kombinálható rotációs vagy helyreállítási kapcsolóval.")
     if args.schedule and (args.resume or args.recover_from_backup or args.allow_delete):

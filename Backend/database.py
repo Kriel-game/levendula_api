@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Kiolvassuk a DATABASE_URL környezeti változót.
-# Ha nincs megadva (pl. helyi tesztelésnél .env nélkül), tartalékként (fallback)
+# Ha nincs megadva (pl. helyi tesztelésnél .env nélkül), tartalékértékként
 # egy helyi SQLite adatbázist használ, így a program minden környezetben elindul.
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./vendeghaz_biztonsag.db")
 if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):

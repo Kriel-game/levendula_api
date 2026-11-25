@@ -1,3 +1,5 @@
+"""A backend, frontend és karbantartási állapotellenőrző közös indítója."""
+
 import signal
 import subprocess
 import sys
@@ -13,7 +15,9 @@ COMMANDS = (
 )
 
 
+# Folyamatok indítása és leállítása
 def stop_processes(processes):
+    """Leállítja a futó szolgáltatásokat, szükség esetén kényszerítve."""
     running = [process for process in processes if process.poll() is None]
     for process in running:
         try:
@@ -33,6 +37,7 @@ def stop_processes(processes):
 
 
 def main():
+    """Elindítja a szolgáltatásokat, és kilépéskor leállítja a többit."""
     processes = []
     try:
         for name, command in COMMANDS:
