@@ -12,10 +12,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 import httpx
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -613,7 +616,8 @@ async def _create_or_recover_database(api, state, owner_id, plan, region, postgr
                 "ownerId": owner_id,
                 "plan": plan,
                 "region": region,
-                "postgresVersion": postgres_version,
+                "version": postgres_version,
+                "ipAllowList": [{"cidrBlock": "0.0.0.0/0", "description": "Allow all"}],
             },
         )
     except RotationError as exc:
@@ -650,6 +654,9 @@ async def _wait_database_available(api, database_id):
         data = response.json()
         database = data.get("postgres", data)
         if database.get("status") == "available":
+            if not database.get("connectionInfo"):
+                conn_response = await api.request("GET", f"/postgres/{database_id}/connection-info")
+                database["connectionInfo"] = conn_response.json()
             return database
         if database.get("status") in {"failed", "deleted", "deactivated"}:
             raise RotationError("Az új adatbázis nem vált elérhetővé.")
